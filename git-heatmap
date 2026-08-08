@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""Render a GitHub-style commit-frequency heatmap for any local git repository.
+
+Reads commit dates straight out of `git log` and writes a single self-contained
+HTML file -- no network, no dependencies, no build step. Because the executable
+is named `git-heatmap`, git exposes it as a subcommand: `git heatmap`.
+
+    git heatmap                          # current repo, opens in your browser
+    git heatmap ~/src/foo -o foo.html    # another repo, explicit output
+    git heatmap --author 'Jake' --all    # one author, across every ref
+    git heatmap --json                   # per-day counts on stdout, no HTML
+
+Exit codes: 0 ok, 1 usage/runtime error, 2 repo has no matching commits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+import webbrowser
+from collections import Counter
+from datetime import date
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+log = logging.getLogger("git-heatmap")
+
+
+class GitHeatmapError(RuntimeError):
+    """Anything that should exit non-zero with a clean message, not a traceback."""
+
+
+# ---------------------------------------------------------------- git plumbing
+
+
+def run_git(repo: Path, *args: str) -> str:
+    """Run a git command in `repo` and return stdout, raising on failure."""
+    cmd = ["git", "-C", str(repo), *args]
+    log.debug("running: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:  # git itself missing
+        raise GitHeatmapError("`git` was not found on PATH") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        raise GitHeatmapError(
+            f"git {' '.join(args[:2])} failed: {detail[0] if detail else 'unknown error'}"
+        )
+    return proc.stdout
+
+
+def resolve_repo(path: Path) -> Path:
+    """Return the work-tree root containing `path`."""
+    if not path.exists():
+        raise GitHeatmapError(f"no such path: {path}")
+    try:
+        top = run_git(path, "rev-parse", "--show-toplevel").strip()
+    except GitHeatmapError as exc:
+        raise GitHeatmapError(f"{path} is not inside a git repository") from exc
+    return Path(top) if top else path
+
+
+def repo_label(repo: Path) -> str:
+    """`owner/name` when a remote makes that knowable, else the directory name."""
+    try:
+        url = run_git(repo, "remote", "get-url", "origin").strip()
+    except GitHeatmapError:
+        return repo.name
+    if not url:
+        return repo.name
+    url = url.removesuffix(".git")
+    if url.startswith("git@") and ":" in url:  # git@github.com:owner/name
+        url = url.split(":", 1)[1]
+    parts = [p for p in url.replace("//", "/").split("/") if p]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else repo.name
+
+
+def collect_counts(repo: Path, args: argparse.Namespace) -> Counter[str]:
+    """Per-day commit counts as {'YYYY-MM-DD': n}, honoring the CLI filters."""
+    # %ad/%cd with --date=short yields the date in the recorded local offset,
+    # which is what a contribution graph should show: the day work happened.
+    fmt = "%ad" if args.date == "author" else "%cd"
+    cmd = ["log", "--date=short", f"--pretty=format:{fmt}"]
+    if args.all_refs:
+        cmd.append("--all")
+    else:
+        cmd.append(args.branch)
+    if args.no_merges:
+        cmd.append("--no-merges")
+    for pattern in args.author or []:
+        cmd.append(f"--author={pattern}")
+    if args.since:
+        cmd.append(f"--since={args.since}")
+    if args.until:
+        cmd.append(f"--until={args.until}")
+    if args.path:
+        cmd.append("--")
+        cmd.extend(args.path)
+
+    out = run_git(repo, *cmd)
+    return Counter(line.strip() for line in out.splitlines() if line.strip())
+
+
+def author_summary(repo: Path, args: argparse.Namespace) -> str:
+    """A short human description of whose commits are being shown."""
+    if args.author:
+        return " / ".join(args.author)
+    fmt = "%aN" if args.date == "author" else "%cN"  # %aN respects .mailmap
+    cmd = ["log", "--pretty=format:" + fmt]
+    cmd.append("--all" if args.all_refs else args.branch)
+    if args.no_merges:
+        cmd.append("--no-merges")
+    try:
+        names = {n.strip() for n in run_git(repo, *cmd).splitlines() if n.strip()}
+    except GitHeatmapError:
+        return "all authors"
+    if len(names) == 1:
+        return next(iter(names))
+    return f"all authors ({len(names)})"
+
+
+# ------------------------------------------------------------------- rendering
+
+
+def build_meta(repo: Path, args: argparse.Namespace, counts: Counter[str]) -> dict:
+    scope_bits = [f"{args.date} dates"]
+    scope_bits.insert(0, author_summary(repo, args))
+    if args.all_refs:
+        scope_bits.append("all refs")
+    elif args.branch != "HEAD":
+        scope_bits.append(args.branch)
+    if args.no_merges:
+        scope_bits.append("no merges")
+    if args.path:
+        scope_bits.append("paths: " + " ".join(args.path))
+    if args.since:
+        scope_bits.append(f"since {args.since}")
+    if args.until:
+        scope_bits.append(f"until {args.until}")
+
+    label = args.label or repo_label(repo)
+    return {
+        "repo": label,
+        "scope": " — ".join([label, ", ".join(scope_bits)]),
+        "title": args.title or f"{label} — commit frequency",
+        "today": date.today().isoformat(),
+        "dateKind": args.date,
+        "generator": f"git-heatmap {__version__}",
+    }
+
+
+def render_html(counts: Counter[str], meta: dict) -> str:
+    data_json = json.dumps(dict(sorted(counts.items())), separators=(",", ":"))
+    return (
+        TEMPLATE
+        .replace("__DATA_JSON__", data_json)
+        .replace("__META_JSON__", json.dumps(meta))
+        .replace("__TITLE__", escape_html(meta["title"]))
+    )
+
+
+def escape_html(text: str) -> str:
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+# ------------------------------------------------------------------------- cli
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="git-heatmap",
+        description="Render a GitHub-style commit-frequency heatmap for a git repo.",
+        epilog=(
+            "Installed on PATH as `git-heatmap`, it also runs as `git heatmap`.\n"
+            "Note: git rewrites `git heatmap --help` into a man-page lookup, so use\n"
+            "`git heatmap -h` or `git-heatmap --help` to see this text."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("repo", nargs="?", default=".", type=Path,
+                   help="repository path (default: current directory)")
+    p.add_argument("-o", "--output", type=Path,
+                   help="write HTML here (default: a temp file)")
+    p.add_argument("--no-open", action="store_true",
+                   help="do not open the result in a browser")
+    p.add_argument("--json", action="store_true",
+                   help="print per-day counts as JSON and exit; no HTML")
+
+    scope = p.add_argument_group("commit selection")
+    scope.add_argument("--author", action="append", metavar="PATTERN",
+                       help="only commits by this author (repeatable; git regex)")
+    scope.add_argument("--branch", default="HEAD", metavar="REF",
+                       help="ref to walk (default: HEAD)")
+    scope.add_argument("--all", dest="all_refs", action="store_true",
+                       help="walk every ref instead of just --branch")
+    scope.add_argument("--no-merges", action="store_true",
+                       help="exclude merge commits")
+    scope.add_argument("--since", metavar="DATE", help="passed through to git log")
+    scope.add_argument("--until", metavar="DATE", help="passed through to git log")
+    scope.add_argument("--date", choices=("author", "committer"), default="author",
+                       help="bucket by author or committer date (default: author)")
+    scope.add_argument("--path", nargs="+", metavar="PATHSPEC",
+                       help="limit to commits touching these paths")
+
+    pres = p.add_argument_group("presentation")
+    pres.add_argument("--title", help="page title (default: derived from the repo)")
+    pres.add_argument("--label", help="repo label shown on the page")
+
+    p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    p.add_argument("--version", action="version", version=f"git-heatmap {__version__}")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    try:
+        repo = resolve_repo(args.repo.expanduser().resolve())
+        counts = collect_counts(repo, args)
+
+        if not counts:
+            log.error("no commits matched in %s", repo)
+            return 2
+
+        if args.json:
+            json.dump(dict(sorted(counts.items())), sys.stdout, indent=2)
+            sys.stdout.write("\n")
+            return 0
+
+        meta = build_meta(repo, args, counts)
+        html = render_html(counts, meta)
+
+        if args.output:
+            out = args.output.expanduser().resolve()
+            out.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            slug = meta["repo"].replace("/", "-")
+            out = Path(tempfile.gettempdir()) / f"{slug}-commit-frequency.html"
+        out.write_text(html, encoding="utf-8")
+
+        total, active = sum(counts.values()), len(counts)
+        log.info(
+            "%s commit%s across %s day%s → %s",
+            f"{total:,}", "" if total == 1 else "s",
+            f"{active:,}", "" if active == 1 else "s", out,
+        )
+
+        if not args.no_open:
+            webbrowser.open(out.as_uri())
+        return 0
+
+    except GitHeatmapError as exc:
+        log.error("%s", exc)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+# -------------------------------------------------------------------- template
+# Single self-contained page. Placeholders: __DATA_JSON__, __META_JSON__, __TITLE__.
+
+TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; }
+
+  .viz-root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --border:         rgba(11,11,11,0.10);
+    --level-0:        #e6e6e0;
+    --level-1:        #a8dcae;
+    --level-2:        #5cb96c;
+    --level-3:        #2b8442;
+    --level-4:        #0d5424;
+    --focus:          #2a78d6;
+
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page);
+    color: var(--text-primary);
+    min-height: 100vh;
+    padding: 32px 24px 64px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --border:         rgba(255,255,255,0.10);
+      --level-0:        #272725;
+      --level-1:        #14512a;
+      --level-2:        #1e8038;
+      --level-3:        #38b04e;
+      --level-4:        #6fd982;
+      --focus:          #3987e5;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --border:         rgba(255,255,255,0.10);
+    --level-0:        #272725;
+    --level-1:        #14512a;
+    --level-2:        #1e8038;
+    --level-3:        #38b04e;
+    --level-4:        #6fd982;
+    --focus:          #3987e5;
+  }
+
+  .wrap { max-width: 1000px; margin: 0 auto; }
+
+  .eyebrow { font-size: 13px; color: var(--text-muted); letter-spacing: .01em; margin: 0 0 6px; }
+  .hero { font-size: 40px; line-height: 1.1; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.02em; }
+  .hero-sub { font-size: 14px; color: var(--text-secondary); margin: 0 0 24px; }
+
+  /* filter row: one row, above everything it scopes */
+  .filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 16px; }
+  .seg { display: flex; flex-wrap: wrap; gap: 4px; }
+  .seg button, .view-toggle button {
+    font: inherit; font-size: 13px; line-height: 1;
+    /* appearance:none keeps these off the native ButtonFace path -- without it a
+       var() that fails to resolve drops the declaration and the control repaints
+       as an unreadable system-gray pill in dark mode. */
+    appearance: none; -webkit-appearance: none;
+    padding: 7px 11px; border-radius: 7px; cursor: pointer;
+    background: var(--surface-1, #fcfcfb); color: var(--text-secondary, #52514e);
+    border: 1px solid var(--border, rgba(11,11,11,0.10));
+    transition: background .12s, color .12s;
+  }
+  .seg button:hover, .view-toggle button:hover { background: var(--gridline); color: var(--text-primary); }
+  .seg button[aria-pressed="true"], .view-toggle button[aria-pressed="true"] {
+    background: var(--text-primary); color: var(--surface-1); border-color: var(--text-primary);
+  }
+  .view-toggle { display: flex; gap: 4px; margin-left: auto; }
+  button:focus-visible, .cell:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 20px; position: relative; }
+  .scroller { overflow-x: auto; padding-bottom: 4px; }
+  .cal { display: inline-block; min-width: min-content; }
+
+  .months { display: grid; gap: 3px; margin-left: 34px; margin-bottom: 5px; font-size: 12px; color: var(--text-muted); height: 14px; }
+  .months span { grid-row: 1; white-space: nowrap; }
+
+  .body { display: flex; gap: 6px; }
+  .days { display: grid; grid-template-rows: repeat(7, 12px); gap: 3px; width: 28px; font-size: 11px; color: var(--text-muted); align-items: center; }
+  .grid { display: grid; grid-template-rows: repeat(7, 12px); grid-auto-flow: column; gap: 3px; }
+
+  .cell { width: 12px; height: 12px; border-radius: 2px; padding: 0; background: var(--level-0); border: none; cursor: default; position: relative; }
+  /* hit target extends into the 3px surface gap in every direction */
+  .cell::after { content: ""; position: absolute; inset: -3px; }
+  .cell[data-level="1"] { background: var(--level-1); }
+  .cell[data-level="2"] { background: var(--level-2); }
+  .cell[data-level="3"] { background: var(--level-3); }
+  .cell[data-level="4"] { background: var(--level-4); }
+  .cell[data-empty="true"] { background: transparent; pointer-events: none; }
+
+  .legend { display: flex; align-items: center; gap: 6px; justify-content: flex-end; margin-top: 12px; font-size: 12px; color: var(--text-muted); flex-wrap: wrap; }
+  .legend .swatch { width: 12px; height: 12px; border-radius: 2px; }
+
+  /* tooltip enhances; it is never the only path to a value */
+  .tip {
+    position: absolute; z-index: 10; pointer-events: none;
+    background: var(--text-primary); color: var(--surface-1);
+    font-size: 12px; line-height: 1.35; padding: 6px 9px; border-radius: 6px;
+    white-space: nowrap; opacity: 0; transform: translate(-50%, -100%); transition: opacity .1s;
+  }
+  .tip[data-show="true"] { opacity: 1; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 16px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .tile .label { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
+  .tile .value { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
+  .tile .note { font-size: 12px; color: var(--text-secondary); margin-top: 3px; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+  caption { text-align: left; font-size: 13px; color: var(--text-secondary); padding-bottom: 10px; }
+  th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--gridline); }
+  th:first-child, td:first-child { text-align: left; font-variant-numeric: normal; }
+  thead th { color: var(--text-muted); font-weight: 500; font-size: 12px; }
+  tfoot td { font-weight: 600; border-bottom: none; border-top: 1px solid var(--border); }
+  [hidden] { display: none !important; }
+
+  .footnote { font-size: 12px; color: var(--text-muted); margin-top: 18px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div class="viz-root">
+<div class="wrap">
+
+  <p class="eyebrow" id="eyebrow"></p>
+  <h1 class="hero" id="hero">&mdash;</h1>
+  <p class="hero-sub" id="heroSub">&mdash;</p>
+
+  <div class="filters">
+    <div class="seg" id="windowSeg" role="group" aria-label="Time window"></div>
+    <div class="view-toggle" role="group" aria-label="View">
+      <button type="button" id="btnGraph" aria-pressed="true">Graph</button>
+      <button type="button" id="btnTable" aria-pressed="false">Table</button>
+    </div>
+  </div>
+
+  <section class="card" id="graphCard" aria-labelledby="hero">
+    <div class="scroller">
+      <div class="cal">
+        <div class="months" id="months" aria-hidden="true"></div>
+        <div class="body">
+          <div class="days" aria-hidden="true">
+            <span style="grid-row:2">Mon</span>
+            <span style="grid-row:4">Wed</span>
+            <span style="grid-row:6">Fri</span>
+          </div>
+          <div class="grid" id="grid" role="group" aria-label="Commits per day"></div>
+        </div>
+      </div>
+    </div>
+    <div class="legend" aria-hidden="true">
+      <span>Less</span>
+      <span class="swatch" style="background:var(--level-0)"></span>
+      <span class="swatch" style="background:var(--level-1)"></span>
+      <span class="swatch" style="background:var(--level-2)"></span>
+      <span class="swatch" style="background:var(--level-3)"></span>
+      <span class="swatch" style="background:var(--level-4)"></span>
+      <span>More</span>
+      <span id="legendScale" style="margin-left:8px"></span>
+    </div>
+    <div class="tip" id="tip" role="status"></div>
+  </section>
+
+  <section class="card" id="tableCard" hidden>
+    <table>
+      <caption id="tableCaption">Commits by month</caption>
+      <thead>
+        <tr><th scope="col">Month</th><th scope="col">Commits</th><th scope="col">Active days</th><th scope="col">Busiest day</th></tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+      <tfoot id="tableFoot"></tfoot>
+    </table>
+  </section>
+
+  <div class="tiles" id="tiles"></div>
+  <p class="footnote" id="footnote"></p>
+
+</div>
+</div>
+
+<script>
+const DATA = __DATA_JSON__;
+const META = __META_JSON__;
+
+const DAY = 86400000;
+const iso = d => d.toISOString().slice(0, 10);
+const parse = s => { const [y, m, d] = s.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d)); };
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const WEEKDAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+const fmtDate = d => `${WEEKDAYS[d.getUTCDay()]}, ${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`;
+const n = x => x.toLocaleString("en-US");
+
+const allDates = Object.keys(DATA).sort();
+const FIRST = parse(allDates[0]);
+const LAST = parse(allDates[allDates.length - 1]);
+const TODAY = parse(META.today);
+const YEARS = [];
+for (let y = FIRST.getUTCFullYear(); y <= LAST.getUTCFullYear(); y++) {
+  if (allDates.some(d => d.startsWith(String(y)))) YEARS.push(String(y));
+}
+YEARS.reverse();
+
+// "Last 12 months" is anchored to today, the way a contribution graph reads.
+const WINDOWS = [
+  { id: "12m", label: "Last 12 months", start: new Date(+TODAY - 364 * DAY), end: TODAY },
+  ...YEARS.map(y => ({
+    id: y, label: y,
+    start: new Date(Date.UTC(+y, 0, 1)),
+    end: new Date(Math.min(Date.UTC(+y, 11, 31), +TODAY)),
+  })),
+];
+
+// A dormant repo would open on an empty grid; land on its most recent active year instead.
+const commitsIn = w => allDates.reduce((s, k) => {
+  const t = +parse(k);
+  return s + (t >= +w.start && t <= +w.end ? DATA[k] : 0);
+}, 0);
+let current = commitsIn(WINDOWS[0]) > 0 ? WINDOWS[0] : (WINDOWS[1] || WINDOWS[0]);
+
+/** Quartile thresholds over the non-zero days in range, deduped; falls back to an
+ *  even split of the max when the window has too few distinct values. */
+function buckets(counts) {
+  const nz = counts.filter(c => c > 0).sort((a, b) => a - b);
+  if (!nz.length) return [1, 2, 3, 4];
+  const q = p => nz[Math.min(nz.length - 1, Math.floor(nz.length * p))];
+  let t = [q(0.25), q(0.5), q(0.75)];
+  const max = nz[nz.length - 1];
+  for (let i = 1; i < 3; i++) if (t[i] <= t[i - 1]) t[i] = t[i - 1] + 1;
+  if (t[2] >= max) t = [1, Math.max(2, Math.ceil(max / 3)), Math.max(3, Math.ceil((2 * max) / 3))];
+  return t;
+}
+const levelOf = (c, t) => (c === 0 ? 0 : c <= t[0] ? 1 : c <= t[1] ? 2 : c <= t[2] ? 3 : 4);
+
+function render() {
+  const { start, end } = current;
+  const gridStart = new Date(+start - start.getUTCDay() * DAY);
+  const gridEnd = new Date(+end + (6 - end.getUTCDay()) * DAY);
+
+  const days = [];
+  for (let t = +gridStart; t <= +gridEnd; t += DAY) {
+    const d = new Date(t), key = iso(d);
+    const within = t >= +start && t <= +end;
+    days.push({ d, key, count: within ? (DATA[key] || 0) : null, inRange: within });
+  }
+  const inRange = days.filter(x => x.inRange);
+  const thresholds = buckets(inRange.map(x => x.count));
+  const weeks = Math.ceil(days.length / 7);
+
+  const grid = document.getElementById("grid");
+  grid.replaceChildren();
+  for (const x of days) {
+    const cell = document.createElement("button");
+    cell.type = "button";
+    cell.className = "cell";
+    if (!x.inRange) {
+      cell.dataset.empty = "true";
+      cell.tabIndex = -1;
+      cell.setAttribute("aria-hidden", "true");
+    } else {
+      cell.dataset.level = levelOf(x.count, thresholds);
+      cell.dataset.label =
+        (x.count === 0 ? "No commits" : `${n(x.count)} commit${x.count === 1 ? "" : "s"}`) +
+        ` on ${fmtDate(x.d)}`;
+      cell.setAttribute("aria-label", cell.dataset.label);
+    }
+    grid.appendChild(cell);
+  }
+
+  const months = document.getElementById("months");
+  months.replaceChildren();
+  months.style.gridTemplateColumns = `repeat(${weeks}, 12px)`;
+  let prevMonth = -1, lastLabelCol = -99;
+  for (let w = 0; w < weeks; w++) {
+    // Label from the column's first IN-RANGE day. A year window's leading column
+    // is mostly the previous December, and letting it claim the label crowds out
+    // January entirely.
+    const firstIn = days.slice(w * 7, w * 7 + 7).find(x => x.inRange);
+    if (!firstIn) continue;
+    const m = firstIn.d.getUTCMonth();
+    if (m !== prevMonth && w - lastLabelCol >= 3 && w < weeks - 2) {
+      const span = document.createElement("span");
+      span.textContent = MONTHS[m] + (current.id === "12m" && m === 0 ? " " + firstIn.d.getUTCFullYear() : "");
+      span.style.gridColumnStart = w + 1;
+      months.appendChild(span);
+      lastLabelCol = w;
+    }
+    prevMonth = m;
+  }
+
+  const total = inRange.reduce((s, x) => s + x.count, 0);
+  const active = inRange.filter(x => x.count > 0).length;
+  document.getElementById("hero").textContent =
+    `${n(total)} commit${total === 1 ? "" : "s"} ${current.id === "12m" ? "in the last year" : "in " + current.id}`;
+  document.getElementById("heroSub").textContent =
+    `${fmtDate(start)} – ${fmtDate(end)} · ${n(active)} active day${active === 1 ? "" : "s"} of ${n(inRange.length)} (${Math.round((active / inRange.length) * 100)}%)`;
+
+  // collapse single-value bands: "1-1" reads as noise, "1" reads as a value
+  const band = (lo, hi) => (lo === hi ? `${lo}` : `${lo}–${hi}`);
+  document.getElementById("legendScale").textContent =
+    [band(1, thresholds[0]), band(thresholds[0] + 1, thresholds[1]),
+     band(thresholds[1] + 1, thresholds[2]), `${thresholds[2] + 1}+`].join(" · ");
+
+  renderTiles(inRange, total, active);
+  renderTable(inRange, total);
+}
+
+function renderTiles(inRange, total, active) {
+  let best = { count: 0 };
+  for (const x of inRange) if (x.count > best.count) best = x;
+
+  let streak = 0, bestStreak = 0, streakEnd = null, bestEnd = null;
+  for (const x of inRange) {
+    if (x.count > 0) { streak++; streakEnd = x.d; if (streak > bestStreak) { bestStreak = streak; bestEnd = streakEnd; } }
+    else streak = 0;
+  }
+  const perActive = active ? (total / active).toFixed(1) : "0";
+
+  const tiles = [
+    { label: "Commits", value: n(total), note: `${perActive} per active day` },
+    { label: "Active days", value: n(active), note: `${Math.round((active / inRange.length) * 100)}% of the window` },
+    { label: "Busiest day", value: best.count ? n(best.count) : "—", note: best.count ? fmtDate(best.d) : "no commits" },
+    { label: "Longest streak", value: bestStreak ? `${bestStreak} day${bestStreak === 1 ? "" : "s"}` : "—", note: bestEnd ? `ending ${MONTHS[bestEnd.getUTCMonth()]} ${bestEnd.getUTCDate()}, ${bestEnd.getUTCFullYear()}` : "" },
+  ];
+  document.getElementById("tiles").replaceChildren(...tiles.map(t => {
+    const el = document.createElement("div");
+    el.className = "tile";
+    el.innerHTML = `<div class="label"></div><div class="value"></div><div class="note"></div>`;
+    el.querySelector(".label").textContent = t.label;
+    el.querySelector(".value").textContent = t.value;
+    el.querySelector(".note").textContent = t.note;
+    return el;
+  }));
+}
+
+// table view: the WCAG-clean twin, every value reachable without colour
+function renderTable(inRange, total) {
+  const byMonth = new Map();
+  for (const x of inRange) {
+    if (!x.count) continue;
+    const k = x.key.slice(0, 7);
+    const row = byMonth.get(k) || { commits: 0, days: 0, best: 0, bestDate: null };
+    row.commits += x.count; row.days++;
+    if (x.count > row.best) { row.best = x.count; row.bestDate = x.d; }
+    byMonth.set(k, row);
+  }
+  const body = document.getElementById("tableBody");
+  body.replaceChildren(...[...byMonth.entries()].map(([k, r]) => {
+    const [y, m] = k.split("-");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<th scope="row"></th><td></td><td></td><td></td>`;
+    const c = tr.children;
+    c[0].textContent = `${MONTHS[+m - 1]} ${y}`;
+    c[1].textContent = n(r.commits);
+    c[2].textContent = n(r.days);
+    c[3].textContent = `${n(r.best)} on ${MONTHS[r.bestDate.getUTCMonth()]} ${r.bestDate.getUTCDate()}`;
+    return tr;
+  }));
+  const foot = document.getElementById("tableFoot");
+  foot.innerHTML = `<tr><td>Total</td><td></td><td></td><td></td></tr>`;
+  foot.querySelector("td:nth-child(2)").textContent = n(total);
+  foot.querySelector("td:nth-child(3)").textContent = n([...byMonth.values()].reduce((s, r) => s + r.days, 0));
+  document.getElementById("tableCaption").textContent =
+    `Commits by month — ${current.label}. Months with no commits are omitted.`;
+}
+
+// tooltip: hover and keyboard focus show the same thing
+const tip = document.getElementById("tip");
+const card = document.getElementById("graphCard");
+function showTip(cell) {
+  if (!cell || !cell.dataset.label) return hideTip();
+  tip.textContent = cell.dataset.label;
+  tip.dataset.show = "true";
+  const c = cell.getBoundingClientRect(), p = card.getBoundingClientRect();
+  tip.style.left = `${c.left - p.left + c.width / 2}px`;
+  tip.style.top = `${c.top - p.top - 6}px`;
+}
+const hideTip = () => { tip.dataset.show = "false"; };
+const gridEl = document.getElementById("grid");
+gridEl.addEventListener("pointerover", e => showTip(e.target.closest(".cell")));
+gridEl.addEventListener("pointerleave", hideTip);
+gridEl.addEventListener("focusin", e => showTip(e.target.closest(".cell")));
+gridEl.addEventListener("focusout", hideTip);
+
+const seg = document.getElementById("windowSeg");
+seg.replaceChildren(...WINDOWS.map(w => {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = w.label;
+  b.setAttribute("aria-pressed", String(w === current));
+  b.addEventListener("click", () => {
+    current = w;
+    for (const other of seg.children) other.setAttribute("aria-pressed", String(other === b));
+    hideTip();
+    render();
+  });
+  return b;
+}));
+
+const btnGraph = document.getElementById("btnGraph"), btnTable = document.getElementById("btnTable");
+function setView(graph) {
+  document.getElementById("graphCard").hidden = !graph;
+  document.getElementById("tableCard").hidden = graph;
+  btnGraph.setAttribute("aria-pressed", String(graph));
+  btnTable.setAttribute("aria-pressed", String(!graph));
+}
+btnGraph.addEventListener("click", () => setView(true));
+btnTable.addEventListener("click", () => setView(false));
+
+document.getElementById("eyebrow").textContent = META.scope;
+document.getElementById("footnote").textContent =
+  `${n(allDates.reduce((s, k) => s + DATA[k], 0))} commits total across ${n(allDates.length)} distinct days, ` +
+  `${allDates[0]} to ${allDates[allDates.length - 1]}. Counted by ${META.dateKind} date in the recorded local timezone. ` +
+  `Colour buckets are quartiles of the non-zero days within the selected window, so shades are comparable inside a ` +
+  `window but not across windows — the tooltip and table carry the real numbers. Generated by ${META.generator}.`;
+
+render();
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    sys.exit(main())

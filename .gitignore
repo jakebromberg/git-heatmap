@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# generated output — the whole point is that these are disposable
+*.html
+!docs/*.html
