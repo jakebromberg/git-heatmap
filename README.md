@@ -105,3 +105,7 @@ tests/               # stdlib unittest, programmatic fixture repos
 ```
 
 The HTML template is a module-level string at the bottom of `git-heatmap`, with `__DATA_JSON__`, `__META_JSON__`, and `__TITLE__` placeholders. It is substituted with `str.replace`, never `.format` or f-strings — the template is full of CSS and JS braces that would be misread as format fields.
+
+## License
+
+[MIT](LICENSE) © 2026 Jake Bromberg
